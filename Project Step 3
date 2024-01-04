@@ -1,0 +1,204 @@
+---
+title: "Project Step 3"
+author: "Max S and Josh C"
+date: "2023-11-20"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# knit options
+knitr::opts_chunk$set(echo = F,
+                      results = 'markup',
+                      fig.width = 4,
+                      fig.height = 3,
+                      fig.align = 'center',
+                      message = F,
+                      warning = F)
+
+# packages
+library(faraway)
+library(tidyverse)
+library(tidymodels)
+library(modelr)
+library(ggplot2)
+library(dplyr)
+```
+
+## Linear Modeling with NFL Data
+
+### Introduction
+
+In the NFL, success in the passing game is a key part of winning a football game. In this project, we seek to create a model to predict passing game success (quantified as Expected Points Added (EPA) Passing per play) using play-by-play and game level data from NFLFastR ((<https://github.com/nflverse/nflfastR>)). All of our input variables will be pre-game factors. Our data is a collection of outdoor football games from the 2021 and 2022 seasons.
+
+```{r, echo=F}
+data <- read.csv('/Users/joshc/Downloads/nflgameproject.csv') #set this to the proper location
+
+```
+### Feature Engineering
+
+We need to take a few steps to ensure we have the proper features to create the best model. We want to change some of our weather terms into categorical variables so we can explore whether it helps improve their values in our model. We will create new categorical variables for wind and temperature. We will also combine lightrainsnow and rainsnow as there are few instances of lightrainsnow. We are also changing the variable 'a_turf' in surface to 'fieldturf' as both are turf surfaces and there and very few instances of a_turf.
+
+Before training the model, we want to higlight some analysis of a possible interaction variable. In part 2 of our project, we showed that wind was a small but relevant factor in predicting passing success. We wanted to see if colder weather may make wind a stronger effect. Plots comparing wind on EPA passing are below, split out by data where the temperature was over 40 degrees Fahrenheit and under 40 degrees.
+
+```{r fig.cap = "Passing vs Wind in Different Temperatures"}
+data$cold <- ifelse(data$temp < 40, "Under 40", "Over 40")
+data$high_wind <- ifelse(data$wind > 15, "high_wind", "low_wind")
+data$precipitation<- trimws(data$precipitation)
+data$precipitation <- sub('lightrainsnow', 'rainsnow', data$precipitation)
+
+data$surface <- trimws(data$surface)
+data$surface <- sub('a_turf', 'fieldturf', data$surface)
+```
+Interestingly enough, the relationship that stands out is actually between in game pass rate (pass_rate) and wind in cold temperatures. This suggests teams may not believe they will have success passing the ball on cold days with high wind.
+
+
+```{r}
+set.seed(999)
+proportion <- 0.8
+train_indices <- sample(seq_len(nrow(data)), size = round(proportion * nrow(data)))
+train_set <- data[train_indices, ]
+test_set <- data[-train_indices, ]
+
+```
+
+
+## Creating the models
+
+We will be creating two models. A "Vegas" model, meaning a model including sportsbook factors like spread and total, and a "Betting" model, one without those sportsbook factors that could be used for betting or fantasy sports purposes. We'll start with the Betting model.
+
+```{r, echo=T}
+betting_model <- lm(pass_epa_game ~ wind + wind:cold + temp + precipitation + epa_rush_last3
+           + epa_pass_last3 + pass_rate_last3 + surface, data = train_set)
+summary(betting_model)$r.squared
+```
+
+Let's train the Vegas model.
+
+```{r, echo=T}
+vegas_model <- lm(pass_epa_game ~ spread_line + total_line + wind + wind:cold + temp + precipitation + epa_rush_last3
+           + epa_pass_last3 + pass_rate_last3 + surface, data = train_set)
+summary(vegas_model)$r.squared
+```
+
+The R-squared on the Vegas model is superior to the betting model. Comparing the models using an F-test also shows that the Vegas Model is an improvement over the betting model as the p-value of the F test is very small.
+
+```{r}
+anova(vegas_model, betting_model)
+```
+
+To improve our Vegas Model, we used stepwise backward selection. The final model is below.
+```{r}
+#step_result <- stats::step(vegas_model, direction="backward", test="F")
+
+final_vegas_model <- lm(pass_epa_game ~ wind + temp + precipitation
+                        + spread_line + total_line, data = train_set)
+
+summary(final_vegas_model)
+```
+Using the predicted values on the test data, we calculate the r-squared and adjusted r-squared of the final model.
+```{r, echo=T}
+predicted_values <- predict(final_vegas_model, newdata = test_set)
+
+actual <- test_set$pass_epa_game
+mean_actual <- mean(actual)
+sst <- sum((actual - mean_actual)^2)
+ssr <- sum((predicted_values - mean_actual)^2)
+ssres <- sum((actual - predicted_values)^2)
+rsquared <- ssr / sst
+
+num_predictors <- length(coefficients(final_vegas_model)) - 1
+n <- length(actual)
+adj_rsquared <- 1 - ((1 - rsquared) * (n - 1) / (n - num_predictors - 1))
+
+rsquared
+adj_rsquared
+```
+### Influence Points
+
+```{r, out.width='.49\\linewidth', fig.width=3, fig.height=3,fig.show='hold',fig.align='center'}
+fittedvals <- fitted(final_vegas_model)
+residys<-rstudent(final_vegas_model)
+
+cooks_distance <- cooks.distance(final_vegas_model)
+
+par(mfrow = c(1,2))
+
+ggplot(data = train_set , aes(x = fittedvals, y = residys)) +geom_point() + labs( x = 'Fitted Values', y = 'Studentized Residuals') + geom_hline(yintercept = 0, linetype = "solid", color = "red")
+
+plot(cooks_distance, pch = 20, main = "Cook's Distance Plot", xlab = "Observation", ylab = "Cook's Distance")
+```
+Observing the studentized residual and Cook's Distance plots, we can see that there is 3 outliers in the data set. There were no leverage points in this data set. Now we will remove them from the data to see how affect they actually have on the model.
+
+```{r}
+outlier_indices <- which(cooks.distance(final_vegas_model) > .05)
+no_outliers <- train_set[-outlier_indices, ]
+vegas_no_outliers <- lm(pass_epa_game ~ wind + temp + precipitation
+                        + spread_line + total_line, data = no_outliers)
+summary(vegas_no_outliers)$r.squared
+summary(vegas_no_outliers)$fstatistic
+summary(final_vegas_model)$r.squared
+summary(final_vegas_model)$fstatistic
+```
+
+The top 2 boxes are the $R^2$ and F statistic for the model without the outliers, and the bottom 2 boxes are with the outliers. Clearly, the difference in variation explained is very small and the significance of the F tests are essentially the same. Thus, we will continue with our outliers present.
+
+### Coeficient Interpretation
+
+Our$\hat{\beta}_0 =$ -.338 meaning that the expected value of EPA for any given passing play is -.34 points if all other variable values are 0. 
+
+Our$\hat{\beta}_1 =$ -.007 meaning that after accounting for the other variables, the mean EPA per play is expected to decrease by .007 points per wind MPH.
+
+Our$\hat{\beta}_2 =$ .001 meaning that after accounting for the other variables, the mean EPA per play is expected to increase by .001 per degree of temperature.
+
+Our$\hat{\beta}_3 =$ -.121 meaning that after accounting for the other variables, the mean EPA per play is expected to decrease by .121 when it is precipitating versus not.
+
+Our$\hat{\beta}_4 =$ -.016 meaning that after accounting for the other variables, the mean EPA per play is expected to decrease by .016 per point of increase in your spread line. 
+
+Our$\hat{\beta}_5 =$ .008 meaning that after accounting for the other variables,  the mean EPA per play is expected to increase by .008 per point of increase in total line.
+
+
+### Some Intervals
+
+Since we have a categorical variable keeping track of precipitation (precipitationrainsnow), we will make intervals corresponding to 'with precipitation,' and 'without precipitation.'
+
+```{r}
+set.seed(412)
+x_bar <- train_set %>% select(-pass_epa_game) %>% summarize(across(everything(), mean))
+x_game_complete <- sample_n(train_set, 1)
+x_game <- x_game_complete %>% select(-pass_epa_game)
+```
+
+```{r}
+model.0 <- lm(pass_epa_game ~ wind + temp + spread_line + total_line
+              ,subset=precipitation=='noprecip',data = train_set)
+predict(model.0, newdata = x_bar, interval = 'confidence', level = 0.95)
+
+model.1 <- lm(pass_epa_game ~wind + temp + spread_line + total_line, subset=precipitation!='noprecip', data = train_set)
+predict(model.1, newdata = x_bar, interval = 'confidence', level = .95  )
+```
+
+With 95% confidence, the mean Passing EPA for an offense when there is no precipitation, and the other pregame conditions are equal to the average in the data, is estimated to be between -.0134 and .0511 per play. 
+
+Also with 95% confidence, the mean Passing EPA for an offense when there is precipitation, and the other pregame conditions are equal to the average in the data, is estimated to be between -.2751 and .0110. 
+
+```{r}
+predict(model.0, newdata = x_game, interval = 'prediction', level = .95  )
+predict(model.1, newdata = x_game, interval = 'prediction', level = .95  )
+```
+
+
+With 95% confidence, during their selected game, our selected offense's Passing EPA is estimated to be between -.6375 and .5479 per play if there is no precipitation during their game. Also with 95% confidence, our selected offense's Passing EPA is estimated to be between -.8792 and .6708 if there is precipitation during their game.
+
+### Conclusion and General Thoughts
+
+There were a few things we want to highlight about the best model.
+
+- Our wind:cold interaction term did not make it into the final model even though it likely would have been included in a model predicting the rate of passing vs rushing. That indicates that while NFL teams clearly pass the ball less in cold and windy games, there may not be evidence that it’s the best strategy as it doesn't actually hurt their EPA per passing play.
+- A team’s passing success in their last 3 games (epa_pass_last3) was the strongest input in the betting model, but in the final Vegas model it was left out entirely. Why was this? Our best guess is that sportsbook spreads and game totals, which are very efficient and liquid markets, have a team’s recent passing game success baked in (as well as many more factors) and therefore using that stat is redundant.
+
+Lastly, it turns out that while it would be nice to be able to predict football game outcomes accurately using statistics, the adjusted R-squared of our best model isn't that high, it only explains 15.74% of the variance in EPA passing. The old football adage "Any Given Sunday" seems to have been proved true. Football game outcomes, particularly in the passing game, have quite a bit of randomness.
+
+
+
